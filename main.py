@@ -23,6 +23,7 @@ from torchvision import transforms
 
 load_dotenv()
 
+
 def _get_env(key: str, default: Optional[str] = None) -> str:
     value = os.getenv(key)
     if value is None or value == "":
@@ -73,6 +74,19 @@ class FaceRecognitionRequest(BaseModel):
     image_base64: str = Field(..., description="Base64 encoded RGB face image (without data URL prefix)")
     top_k: Optional[int] = Field(default=None, ge=1, le=50)
     threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+
+class FaceRegistrationMultiRequest(BaseModel):
+    employee_id: str
+    employee_name: str
+    images_base64: List[str]
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class FaceRecognitionMultiRequest(BaseModel):
+    images_base64: List[str]
+    top_k: Optional[int] = None
+    threshold: Optional[float] = None
 
 
 class FaceImageProcessor:
@@ -234,12 +248,12 @@ class QdrantVectorStore:
 
 class FaceService:
     def __init__(
-        self,
-        processor: FaceImageProcessor,
-        embedder: AdaFaceEmbedder,
-        store: QdrantVectorStore,
-        default_threshold: float,
-        default_top_k: int,
+            self,
+            processor: FaceImageProcessor,
+            embedder: AdaFaceEmbedder,
+            store: QdrantVectorStore,
+            default_threshold: float,
+            default_top_k: int,
     ) -> None:
         self.processor = processor
         self.embedder = embedder
@@ -258,6 +272,40 @@ class FaceService:
         }
         self.store.upsert(point_id=point_id, vector=embedding, payload=payload)
         return {"point_id": point_id, "employee_id": request.employee_id}
+
+    def register_multi(self, request: FaceRegistrationMultiRequest) -> Dict[str, Any]:
+        point_ids = []
+
+        for idx, img_base64 in enumerate(request.images_base64):
+            try:
+                face_image = self._image_to_face(img_base64)
+                embedding = self.embedder.create_embedding(face_image)
+
+                point_id = str(uuid.uuid4())
+                payload = {
+                    "employee_id": request.employee_id,
+                    "employee_name": request.employee_name,
+                    "metadata": {
+                        **request.metadata,
+                        "index": idx,
+                    },
+                }
+
+                self.store.upsert(point_id, embedding, payload)
+                point_ids.append(point_id)
+
+            except Exception as e:
+                # bỏ frame lỗi, không fail cả request
+                continue
+
+        if not point_ids:
+            raise HTTPException(status_code=400, detail="No valid face found in all images")
+
+        return {
+            "employee_id": request.employee_id,
+            "total_registered": len(point_ids),
+            "point_ids": point_ids,
+        }
 
     def recognize(self, request: FaceRecognitionRequest) -> Dict[str, Any]:
         threshold = request.threshold or self.default_threshold
@@ -285,6 +333,53 @@ class FaceService:
         response["employee_name"] = best.payload.get("employee_name")
         return response
 
+    def recognize_multi(self, request: FaceRecognitionMultiRequest) -> Dict[str, Any]:
+        threshold = request.threshold or self.default_threshold
+        top_k = request.top_k or self.default_top_k
+
+        best_score = -1.0
+        best_candidate = None
+
+        for img_base64 in request.images_base64:
+            try:
+                face_image = self._image_to_face(img_base64)
+                embedding = self.embedder.create_embedding(face_image)
+                results = self.store.search(embedding, limit=top_k)
+
+                if not results:
+                    continue
+
+                candidate = results[0]
+                score = float(candidate.score)
+
+                if score > best_score:
+                    best_score = score
+                    best_candidate = candidate
+
+            except Exception:
+                continue
+
+        if best_candidate is None:
+            return {"matched": False, "reason": "no_face_detected"}
+
+        matched = best_score >= threshold
+
+        response = {
+            "matched": matched,
+            "confidence": best_score,
+            "threshold": threshold,
+            "candidate": {
+                "point_id": best_candidate.id,
+                "payload": best_candidate.payload,
+            },
+        }
+
+        if matched:
+            response["employee_id"] = best_candidate.payload.get("employee_id")
+            response["employee_name"] = best_candidate.payload.get("employee_name")
+
+        return response
+
     def delete(self, point_id: str) -> Dict[str, Any]:
         self.store.delete(point_id=point_id)
         return {"deleted": True, "point_id": point_id}
@@ -294,12 +389,12 @@ class FaceService:
         face = self.processor.extract_face(image)
         if face is None:
             raise HTTPException(status_code=400, detail="No face detected in the image")
-        
+
         debug_dir = Path("tmp")
         debug_dir.mkdir(parents=True, exist_ok=True)
         filename = f"{uuid.uuid4()}.jpg"
         face.save(debug_dir / filename)
-        
+
         return face
 
 
@@ -359,9 +454,20 @@ def recognize_face(request: FaceRecognitionRequest) -> Dict[str, Any]:
     return face_service.recognize(request)
 
 
+@app.post("/face/register-multi")
+def register_face_multi(request: FaceRegistrationMultiRequest):
+    return face_service.register_multi(request)
+
+
+@app.post("/face/recognize-multi")
+def recognize_face_multi(request: FaceRecognitionMultiRequest):
+    return face_service.recognize_multi(request)
+
+
 @app.delete("/face/{point_id}")
 def delete_face(point_id: str) -> Dict[str, Any]:
     return face_service.delete(point_id)
+
 
 @app.get("/health")
 def health_check() -> Dict[str, Any]:
