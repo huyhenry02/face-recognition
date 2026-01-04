@@ -53,10 +53,10 @@ def _get_int(key: str, default: int) -> int:
 QDRANT_URL = _get_env("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = _get_env("QDRANT_API_KEY", "my-secret-key")
 QDRANT_COLLECTION = _get_env("QDRANT_COLLECTION", "faces")
-FACE_REGISTER_THRESHOLD = _get_float("FACE_REGISTER_THRESHOLD", 0.85)
-FACE_SAME_EMPLOYEE_THRESHOLD = _get_float("FACE_SAME_EMPLOYEE_THRESHOLD", 0.75)
+FACE_REGISTER_THRESHOLD = _get_float("FACE_REGISTER_THRESHOLD", 0.6)
+FACE_SAME_EMPLOYEE_THRESHOLD = _get_float("FACE_SAME_EMPLOYEE_THRESHOLD", 0.5)
 
-FACE_RECOGNITION_THRESHOLD = _get_float("FACE_RECOGNITION_THRESHOLD", 0.6)
+FACE_RECOGNITION_THRESHOLD = _get_float("FACE_RECOGNITION_THRESHOLD", 0.5)
 
 FACE_SEARCH_TOPK = _get_int("FACE_SEARCH_TOPK", 5)
 FACE_VECTOR_SIZE = _get_int("FACE_VECTOR_SIZE", 512)
@@ -242,7 +242,7 @@ class QdrantVectorStore:
             collection_name=self.collection,
             points_selector=selector,
         )
-        
+
     def delete_employee(self, employee_id: str) -> int:
         self.client.delete(
             collection_name=self.collection,
@@ -306,68 +306,34 @@ class FaceService:
         self,
         embedding: np.ndarray,
         employee_id: str,
-        force_allow: bool,
-    ):
+    ) -> None:
         results = self.store.search(embedding, limit=5)
 
-        same_employee_best = 0.0
-        other_employee_best = 0.0
+        if not results:
+            return
 
         for r in results:
-            score = float(r.score)
-            eid = r.payload.get("employee_id")
+            matched_employee_id = r.payload.get("employee_id")
+            score = r.score
 
-            if eid == employee_id:
-                same_employee_best = max(same_employee_best, score)
-            else:
-                other_employee_best = max(other_employee_best, score)
-
-        employee_exists = self.store.exists_employee(employee_id)
-
-        # ===== CHƯA TỪNG ĐĂNG KÝ =====
-        if not employee_exists:
-            if other_employee_best >= FACE_REGISTER_THRESHOLD:
+            if matched_employee_id != employee_id and score >= FACE_REGISTER_THRESHOLD:
                 raise HTTPException(
                     status_code=409,
                     detail={
                         "error": "FACE_ALREADY_REGISTERED",
-                        "similarity": other_employee_best,
+                        "message": f"Face already belongs to employee {matched_employee_id}",
+                        "similarity": score,
                     },
                 )
-            return "NEW_EMPLOYEE_OK"
 
-        # ===== ĐÃ ĐĂNG KÝ =====
-        if other_employee_best >= FACE_REGISTER_THRESHOLD:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "FACE_BELONGS_TO_OTHER_EMPLOYEE",
-                    "similarity": other_employee_best,
-                },
-            )
-
-        if same_employee_best >= FACE_SAME_EMPLOYEE_THRESHOLD:
-            return "ADD_IMAGE_OK"
-
-        if force_allow:
-            return "FORCE_ADD_IMAGE"
-
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": "FACE_TOO_DIFFERENT_FROM_EXISTING",
-                "best_similarity": same_employee_best,
-            },
-        )
 
     def register(self, request: FaceRegistrationRequest) -> Dict[str, Any]:
         face_image = self._image_to_face(request.image_base64)
         embedding = self.embedder.create_embedding(face_image)
         # CHECK TRÙNG
-        policy = self._check_registration_policy(
-        embedding=embedding,
-        employee_id=request.employee_id,
-        force_allow=request.force_allow,
+        self._check_registration_policy(
+            embedding=embedding,
+            employee_id=request.employee_id,
         )
 
         point_id = str(uuid.uuid4())
@@ -376,9 +342,8 @@ class FaceService:
             "employee_name": request.employee_name,
             "metadata": request.metadata,
         }
-
-
         self.store.upsert(point_id=point_id, vector=embedding, payload=payload)
+
 
         return {
             "point_id": point_id,
@@ -386,86 +351,62 @@ class FaceService:
         }
 
     def register_multi(self, request: FaceRegistrationMultiRequest) -> Dict[str, Any]:
-        point_ids = []
-        valid_faces = 0
+        """
+        Register multiple face images for ONE employee.
 
-        embeddings_cache = []
+        Rule:
+        - A face can belong to ONLY ONE employee
+        - If ANY image conflicts with another employee -> reject immediately
+        - No batch internal comparison
+        """
 
-        # ===== PHASE 1: CHECK TOÀN BỘ ẢNH (FAIL FAST) =====
-        for img_base64 in request.images_base64:
-            try:
-                face_image = self._image_to_face(img_base64)
-                embedding = self.embedder.create_embedding(face_image)
+        point_ids: List[str] = []
 
-                # ÁP DỤNG LOGIC NGHIỆP VỤ MỚI
-                self._check_registration_policy(
-                    embedding=embedding,
-                    employee_id=request.employee_id,
-                    force_allow=request.force_allow,
-                )
-                # ===== SELF-MATCH TRONG CÙNG BATCH (NÂNG CAO) =====
-                if embeddings_cache:
-                    similarities = [
-                    float(np.dot(prev_embedding, embedding))
-                    for prev_embedding in embeddings_cache
-                    ]
-                    min_similarity = min(similarities)
+        for idx, img_base64 in enumerate(request.images_base64):
+            # 1. Decode + detect face
+            face_image = self._image_to_face(img_base64)
 
-                    if min_similarity < 0.5:
-                        raise HTTPException(
-                        status_code=400,
-                        detail={
-                            "error": "INCONSISTENT_BATCH",
-                            "message": "Images in batch are likely from different persons",
-                            "min_similarity": min_similarity,
-                        },
-                    )
+            # 2. Create embedding
+            embedding = self.embedder.create_embedding(face_image)
 
-
-                embeddings_cache.append(embedding)
-                valid_faces += 1
-
-            except HTTPException:
-                # 1 ảnh vi phạm → reject toàn bộ batch
-                raise
-            except Exception:
-                # ảnh lỗi / không detect được mặt → bỏ qua
-                continue
-
-        if valid_faces < 3:
-            raise HTTPException(
-                status_code=400,
-                detail="Not enough valid face images for registration"
+            # 3. Enforce registration policy (FAIL FAST)
+            self._check_registration_policy(
+                embedding=embedding,
+                employee_id=request.employee_id,
             )
 
-        # ===== PHASE 2: INSERT VECTOR =====
-        for idx, embedding in enumerate(embeddings_cache):
-            try:
-                point_id = str(uuid.uuid4())
-                payload = {
-                    "employee_id": request.employee_id,
-                    "employee_name": request.employee_name,
-                    "metadata": {
-                        **request.metadata,
-                        "index": idx,
-                        "register_type": "multi",
-                    },
-                }
+            # 4. Insert into vector DB
+            point_id = str(uuid.uuid4())
+            payload = {
+                "employee_id": request.employee_id,
+                "employee_name": request.employee_name,
+                "metadata": {
+                    **request.metadata,
+                    "index": idx,
+                    "register_type": "multi",
+                },
+            }
 
-                self.store.upsert(point_id, embedding, payload)
-                point_ids.append(point_id)
+            self.store.upsert(
+                point_id=point_id,
+                vector=embedding,
+                payload=payload,
+            )
 
-            except Exception:
-                continue
+            point_ids.append(point_id)
 
         if not point_ids:
-            raise HTTPException(status_code=400, detail="No valid face found")
+            raise HTTPException(
+                status_code=400,
+                detail="No valid face images for registration"
+            )
 
         return {
             "employee_id": request.employee_id,
             "total_registered": len(point_ids),
             "point_ids": point_ids,
         }
+
 
 
     
